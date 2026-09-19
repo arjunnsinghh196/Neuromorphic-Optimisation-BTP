@@ -1,6 +1,6 @@
 # Lasso — Solving LASSO with a Spiking Neural Network
 
-**RnD / BTP Project · Kruthi S (23B1232)**
+**RnD / BTP Project · Arjun Singh(23B1272)**
 
 A library that takes an optimisation problem and solves it by building a network
 of artificial neurons, switching it on, and letting it settle. The settled state
