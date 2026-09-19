@@ -1,0 +1,16 @@
+[project]
+name = "neuroopt"
+version = "1.0.0"
+description = "Solving convex optimisation, including LASSO, with spiking neural dynamics"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "scipy>=1.10"]
+
+[project.optional-dependencies]
+figures = ["matplotlib>=3.6"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["neuroopt*"]
