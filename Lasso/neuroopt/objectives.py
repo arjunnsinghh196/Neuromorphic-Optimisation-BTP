@@ -1,21 +1,16 @@
 """
-Objective / constraint specification.
+How a problem is written down.
 
-The user writes an optimisation problem as a sum of convex terms plus a list of
-constraints.  ``Problem.canonicalize()`` reduces it to the single canonical form
-that every solver in this library understands:
+You build a problem as a sum of terms plus a list of constraints. Everything
+then gets reduced to one canonical form that all the solvers understand:
 
-    minimize    1/2 x^T Q x + c^T x + sum_i lam1_i |x_i| + sum_i lam2_i x_i^2
-    subject to  A x <= k
-                x >= 0            (optional)
+    minimize   1/2 x'Qx + c'x + sum_i lam1_i |x_i| + sum_i lam2_i x_i^2
+    s.t.       A x <= k
+               x >= 0          (optional)
 
-This is the widest class for which the objective -> neuron mapping is exact:
-
-    Q       -> recurrent synaptic weights          (I - Q)
-    c       -> constant bias current               (-c)
-    lam1    -> firing threshold / dead zone        (per-neuron)
-    lam2    -> firing threshold scale nu_f = 2*lam2 + 1  (per-neuron gain)
-    A, k    -> second (constraint) neuron layer, feedback via A^T
+That's the widest class where the objective-to-neuron mapping is exact, so
+anything outside it is rejected at canonicalize() time rather than silently
+approximated.
 """
 
 from __future__ import annotations
@@ -26,59 +21,56 @@ from typing import List, Optional, Sequence
 import numpy as np
 
 __all__ = [
-    "Term",
-    "Quadratic",
-    "LeastSquares",
-    "L1",
-    "L2Squared",
-    "Constraint",
-    "LinearInequality",
-    "NonNegative",
-    "Box",
-    "Problem",
-    "CanonicalProblem",
+    "Term", "Quadratic", "LeastSquares", "L1", "L2Squared",
+    "Constraint", "LinearInequality", "NonNegative", "Box",
+    "Problem", "CanonicalProblem",
 ]
 
 
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 # objective terms
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 class Term:
-    """Base class for convex objective terms.  Terms compose with ``+``."""
+    """Base class for objective terms. Terms add together into a Problem."""
 
-    n: int  # problem dimension
+    n: int
 
     def __add__(self, other: "Term") -> "Problem":
         return Problem([self]) + other
 
     def __radd__(self, other):
+        # lets sum([...]) work, since sum starts from 0
         if other == 0:
             return Problem([self])
         return NotImplemented
 
 
 class Quadratic(Term):
-    """``1/2 x^T Q x + c^T x`` with Q symmetric positive semi-definite."""
+    """1/2 x'Qx + c'x, with Q symmetric PSD."""
 
     smooth = True
 
     def __init__(self, Q: np.ndarray, c: Optional[np.ndarray] = None):
         Q = np.asarray(Q, dtype=float)
         if Q.ndim != 2 or Q.shape[0] != Q.shape[1]:
-            raise ValueError("Q must be square")
+            raise ValueError("Q must be a square matrix")
+
+        # Only the symmetric part contributes to x'Qx, so just symmetrise.
         if not np.allclose(Q, Q.T, atol=1e-10):
-            Q = 0.5 * (Q + Q.T)  # symmetrise silently; only the sym part matters
+            Q = 0.5 * (Q + Q.T)
+
         self.Q = Q
         self.n = Q.shape[0]
         self.c = np.zeros(self.n) if c is None else np.asarray(c, dtype=float).ravel()
         if self.c.shape != (self.n,):
-            raise ValueError("c has wrong length")
+            raise ValueError(f"c should have length {self.n}, got {self.c.shape}")
 
+        # Non-convex Q means the gradient flow can run away. Catch it early.
         w = np.linalg.eigvalsh(self.Q)
         if w.min() < -1e-8 * max(1.0, abs(w).max()):
             raise ValueError(
-                f"Q is not positive semi-definite (lambda_min = {w.min():.3e}); "
-                "the problem is non-convex and the gradient-flow guarantees fail."
+                f"Q is not positive semi-definite (smallest eigenvalue {w.min():.3e}). "
+                "The problem is non-convex and none of the solvers here will work."
             )
 
     def value(self, x):
@@ -89,29 +81,33 @@ class Quadratic(Term):
 
 
 class LeastSquares(Quadratic):
-    """``1/2 ||s - Phi a||^2``.  Expands to Q = Phi^T Phi, c = -Phi^T s."""
+    """1/2 ||s - Phi a||^2, which is just Q = Phi'Phi and c = -Phi's."""
 
     def __init__(self, Phi: np.ndarray, s: np.ndarray, normalize_atoms: bool = False):
         Phi = np.asarray(Phi, dtype=float)
         s = np.asarray(s, dtype=float).ravel()
         if Phi.shape[0] != s.shape[0]:
-            raise ValueError("Phi and s have incompatible shapes")
+            raise ValueError(
+                f"Phi has {Phi.shape[0]} rows but s has {s.shape[0]} entries"
+            )
+
         self.atom_norms = np.linalg.norm(Phi, axis=0)
         if normalize_atoms:
             if np.any(self.atom_norms == 0):
-                raise ValueError("dictionary contains a zero atom")
+                raise ValueError("dictionary has a zero column, can't normalise it")
             Phi = Phi / self.atom_norms
+
         self.Phi = Phi
         self.s = s
         super().__init__(Phi.T @ Phi, -(Phi.T @ s))
-        self._const = 0.5 * s @ s
 
     def value(self, x):
+        # Evaluate in the original form; it's better conditioned than x'Qx.
         return 0.5 * np.sum((self.s - self.Phi @ x) ** 2)
 
 
 class L1(Term):
-    """``lam * ||x||_1``.  ``lam`` may be scalar or per-coordinate."""
+    """lam * ||x||_1. lam can be a scalar or one value per coordinate."""
 
     smooth = False
 
@@ -124,11 +120,11 @@ class L1(Term):
 
 
 class L2Squared(Term):
-    """``lam * ||x||_2^2``  -- note the square.
+    """lam * ||x||_2^2 - note the square.
 
-    The unsquared ``||x||_2`` is *not* what you want here: its proximal operator
-    is block soft-thresholding, which zeroes the whole vector at once and needs a
-    different neuron.  This class is deliberately named to make that explicit.
+    The unsquared norm has a completely different prox (it zeroes the whole
+    vector at once) and needs a different neuron, so it isn't supported. The
+    name is deliberately explicit so nobody reaches for it by accident.
     """
 
     smooth = True
@@ -138,39 +134,41 @@ class L2Squared(Term):
         self.n = n if n is not None else (self.lam.size if self.lam.ndim else None)
 
     def value(self, x):
-        return float(np.sum(np.broadcast_to(self.lam, x.shape) * x**2))
+        return float(np.sum(np.broadcast_to(self.lam, x.shape) * x ** 2))
 
     def grad(self, x):
         return 2.0 * np.broadcast_to(self.lam, x.shape) * x
 
 
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 # constraints
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 class Constraint:
     pass
 
 
 class LinearInequality(Constraint):
-    """``A x <= k``."""
+    """A x <= k."""
 
     def __init__(self, A: np.ndarray, k: np.ndarray):
         self.A = np.atleast_2d(np.asarray(A, dtype=float))
         self.k = np.asarray(k, dtype=float).ravel()
         if self.A.shape[0] != self.k.shape[0]:
-            raise ValueError("A and k have incompatible shapes")
+            raise ValueError(
+                f"A has {self.A.shape[0]} rows but k has {self.k.shape[0]} entries"
+            )
         self.n = self.A.shape[1]
 
 
 class NonNegative(Constraint):
-    """``x >= 0``.  Handled by the neuron nonlinearity, not by the dual layer."""
+    """x >= 0. Baked into the neuron (rectifier), not sent to the dual layer."""
 
     def __init__(self, n: Optional[int] = None):
         self.n = n
 
 
 class Box(Constraint):
-    """``lo <= x <= hi``; expanded into linear inequalities."""
+    """lo <= x <= hi. Turned into plain linear inequalities when canonicalised."""
 
     def __init__(self, lo=None, hi=None, n: Optional[int] = None):
         self.lo, self.hi, self.n = lo, hi, n
@@ -179,24 +177,22 @@ class Box(Constraint):
         rows, rhs = [], []
         eye = np.eye(n)
         if self.hi is not None:
-            hi = np.broadcast_to(np.asarray(self.hi, dtype=float), (n,))
             rows.append(eye)
-            rhs.append(hi)
+            rhs.append(np.broadcast_to(np.asarray(self.hi, dtype=float), (n,)))
         if self.lo is not None:
-            lo = np.broadcast_to(np.asarray(self.lo, dtype=float), (n,))
             rows.append(-eye)
-            rhs.append(-lo)
+            rhs.append(-np.broadcast_to(np.asarray(self.lo, dtype=float), (n,)))
         if not rows:
-            raise ValueError("Box needs at least one of lo/hi")
+            raise ValueError("Box needs at least one of lo or hi")
         return LinearInequality(np.vstack(rows), np.concatenate(rhs))
 
 
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 # canonical form
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------
 @dataclass
 class CanonicalProblem:
-    """minimize 1/2 x'Qx + c'x + lam1'|x| + lam2'x^2  s.t. Ax <= k, (x >= 0)."""
+    """The one form every solver accepts. See the module docstring."""
 
     Q: np.ndarray
     c: np.ndarray
@@ -219,22 +215,25 @@ class CanonicalProblem:
     def constrained(self) -> bool:
         return self.A is not None
 
-    # ---- evaluation -------------------------------------------------------- #
+    # ---- evaluation --------------------------------------------------------
     def smooth_grad(self, x):
+        """Gradient of the smooth part (everything except the l1 term)."""
         return self.Q @ x + self.c + 2.0 * self.lam2 * x
 
     def objective(self, x):
+        # Prefer the original terms if we have them; LeastSquares evaluates
+        # more accurately in its own form than via Q.
         if self.source is not None:
             return self.source.objective(x)
         return (
             0.5 * x @ self.Q @ x
             + self.c @ x
             + np.sum(self.lam1 * np.abs(x))
-            + np.sum(self.lam2 * x**2)
+            + np.sum(self.lam2 * x ** 2)
         )
 
     def violation(self, x):
-        """Max constraint violation (0 when feasible)."""
+        """Largest constraint violation; 0 if x is feasible."""
         v = 0.0
         if self.A is not None:
             v = max(v, float(np.max(self.A @ x - self.k, initial=0.0)))
@@ -243,30 +242,32 @@ class CanonicalProblem:
         return v
 
     def kkt_residual(self, x, y=None):
-        """Norm of the stationarity residual of the (sub)gradient conditions.
+        """How far x is from satisfying the optimality conditions.
 
-        For inactive coordinates the residual is the distance of ``-g_i`` to the
-        interval ``[-lam1_i, lam1_i]``; for active ones it is ``|g_i + lam1_i
-        sign(x_i)|``.  ``y`` are the dual multipliers, if any.
+        For coordinates that are zero, the subgradient of |x| is the whole
+        interval [-lam1, lam1], so the residual is the distance of -g to that
+        interval. For non-zero coordinates it's simply |g + lam1 * sign(x)|.
+        Pass y (dual multipliers) if the problem has constraints.
         """
         g = self.smooth_grad(x)
         if y is not None and self.A is not None:
             g = g + self.A.T @ y
-        act = np.abs(x) > 1e-12
+
+        active = np.abs(x) > 1e-12
         r = np.empty_like(g)
-        r[act] = g[act] + self.lam1[act] * np.sign(x[act])
-        r[~act] = np.maximum(np.abs(g[~act]) - self.lam1[~act], 0.0)
+        r[active] = g[active] + self.lam1[active] * np.sign(x[active])
+        r[~active] = np.maximum(np.abs(g[~active]) - self.lam1[~active], 0.0)
         return float(np.linalg.norm(r))
 
 
 class Problem:
-    """A sum of :class:`Term` objects plus a list of :class:`Constraint`."""
+    """A list of terms and a list of constraints, nothing more."""
 
     def __init__(self, terms: Sequence[Term], constraints: Sequence[Constraint] = ()):
         self.terms: List[Term] = list(terms)
         self.constraints: List[Constraint] = list(constraints)
 
-    # ---- composition ------------------------------------------------------- #
+    # ---- composition -------------------------------------------------------
     def __add__(self, other):
         if isinstance(other, Problem):
             return Problem(self.terms + other.terms, self.constraints + other.constraints)
@@ -279,24 +280,25 @@ class Problem:
     def subject_to(self, *constraints: Constraint) -> "Problem":
         return Problem(self.terms, self.constraints + list(constraints))
 
-    # ---- evaluation -------------------------------------------------------- #
+    # ---- evaluation --------------------------------------------------------
     def objective(self, x):
-        return float(sum(t.value(np.asarray(x, dtype=float)) for t in self.terms))
+        x = np.asarray(x, dtype=float)
+        return float(sum(t.value(x) for t in self.terms))
 
-    # ---- reduction --------------------------------------------------------- #
-    def canonicalize(self) -> CanonicalProblem:
-        n = None
+    # ---- reduction ---------------------------------------------------------
+    def _infer_dimension(self) -> int:
         for t in self.terms:
             if getattr(t, "n", None):
-                n = t.n
-                break
-        if n is None:
-            for con in self.constraints:
-                if getattr(con, "n", None):
-                    n = con.n
-                    break
-        if n is None:
-            raise ValueError("cannot infer problem dimension; pass n= to a term")
+                return t.n
+        for con in self.constraints:
+            if getattr(con, "n", None):
+                return con.n
+        raise ValueError(
+            "couldn't work out the problem dimension; pass n= to one of the terms"
+        )
+
+    def canonicalize(self) -> CanonicalProblem:
+        n = self._infer_dimension()
 
         Q = np.zeros((n, n))
         c = np.zeros(n)
@@ -312,10 +314,10 @@ class Problem:
             elif isinstance(t, L2Squared):
                 lam2 += np.broadcast_to(t.lam, (n,))
             else:
-                raise TypeError(f"unsupported objective term: {type(t).__name__}")
+                raise TypeError(f"don't know how to handle term {type(t).__name__}")
 
         if np.any(lam1 < 0) or np.any(lam2 < 0):
-            raise ValueError("regularisation weights must be non-negative")
+            raise ValueError("regularisation weights have to be >= 0")
 
         rows, rhs, nonneg = [], [], False
         for con in self.constraints:
@@ -323,13 +325,15 @@ class Problem:
                 con = con.expand(n)
             if isinstance(con, LinearInequality):
                 if con.A.shape[1] != n:
-                    raise ValueError("constraint dimension mismatch")
+                    raise ValueError(
+                        f"constraint has {con.A.shape[1]} columns, problem has {n} variables"
+                    )
                 rows.append(con.A)
                 rhs.append(con.k)
             elif isinstance(con, NonNegative):
                 nonneg = True
             else:
-                raise TypeError(f"unsupported constraint: {type(con).__name__}")
+                raise TypeError(f"don't know how to handle constraint {type(con).__name__}")
 
         A = np.vstack(rows) if rows else None
         k = np.concatenate(rhs) if rhs else None

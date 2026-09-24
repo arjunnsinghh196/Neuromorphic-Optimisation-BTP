@@ -1,23 +1,20 @@
 """
-Compile a :class:`CanonicalProblem` into a network of neurons.
+Turn a CanonicalProblem into a network: weights, biases, thresholds.
 
-The mapping implemented here is the one derived in the project notes, with two
-corrections that matter for correctness:
+Two details here are easy to get wrong and both matter:
 
-1. **No self-synapse.**  The recurrent weight matrix is ``W = I - Q``, whose
-   diagonal vanishes *only if* ``diag(Q) = 1``.  A neuron's own inhibition is its
-   reset, not a synapse.  If the diagonal is not unity the compiler rescales the
-   problem (see :func:`normalize`) rather than silently solving a different
-   problem.
+1. No self-synapse. The recurrent weights are W = I - Q, and that diagonal is
+   only zero when diag(Q) = 1. A neuron's self-inhibition is its reset, not a
+   synapse, so if the diagonal isn't 1 we rescale the variables first
+   (see normalize) instead of quietly solving a slightly different problem.
 
-2. **Elastic-net gain.**  The l2 weight enters as the firing threshold
-   ``nu_f = 2*lam2 + 1``, the l1 weight as the dead zone ``lam1``.  The synaptic
-   weights are untouched by either.
+2. The l2 term doesn't touch the weights. It shows up as the firing threshold
+   nu_f = 2*lam2 + 1. The l1 term is the dead zone lam1. That's it.
 
-Resulting dynamics (continuous time, one layer per role):
+The dynamics every backend implements, in continuous time:
 
-    primal:  u_dot = -u + W a - c - A^T v ,   a = shrink(u, lam1) / nu_f
-    dual:    w_dot = beta (A a - k) ,         v = [w]_+
+    primal:  u' = -u + W a - c - A'v        a = shrink(u, lam1) / nu_f
+    dual:    w' = beta (A a - k)            v = max(w, 0)
 """
 
 from __future__ import annotations
@@ -34,7 +31,7 @@ __all__ = ["NetworkSpec", "compile_network", "normalize"]
 
 @dataclass
 class Scaling:
-    """``x_original = scale * x_network``."""
+    """Maps between the user's variables and the network's. x_user = scale * x_net."""
 
     scale: np.ndarray
 
@@ -47,16 +44,16 @@ class Scaling:
 
 @dataclass
 class NetworkSpec:
-    """Everything a solver backend needs: weights, biases, neuron parameters."""
+    """Everything a solver needs to run the network."""
 
-    # primal (gradient-descent) layer
-    W: np.ndarray            # recurrent weights, I - Q, zero diagonal
-    bias: np.ndarray         # constant input current, -c
-    lam1: np.ndarray         # dead zone / firing threshold offset
-    nu_f: np.ndarray         # firing threshold, 2*lam2 + 1
-    nonneg: bool             # rectified (one-sided) neurons
+    # primal layer (one neuron per variable)
+    W: np.ndarray        # recurrent weights, I - Q with the diagonal zeroed
+    bias: np.ndarray     # constant input current, -c
+    lam1: np.ndarray     # dead zone
+    nu_f: np.ndarray     # firing threshold, 2*lam2 + 1
+    nonneg: bool         # rectified neurons?
 
-    # dual (constraint) layer
+    # dual layer (one neuron per constraint), or None
     A: Optional[np.ndarray] = None
     k: Optional[np.ndarray] = None
 
@@ -74,28 +71,25 @@ class NetworkSpec:
     def m(self):
         return 0 if self.A is None else self.A.shape[0]
 
-    # ---- neuron nonlinearity ---------------------------------------------- #
-    def activation(self, u):
-        """Thresholded readout ``a = shrink(u, lam1) / nu_f``."""
-        if self.nonneg:
-            return np.maximum(u - self.lam1, 0.0) / self.nu_f
-        return np.sign(u) * np.maximum(np.abs(u) - self.lam1, 0.0) / self.nu_f
-
+    # ---- neuron nonlinearity -----------------------------------------------
     def drive(self, u):
-        """Soft-thresholded soma current that charges the membrane.
+        """Soft-thresholded soma current: shrink(u, lam1).
 
-        This is the signed generalisation of the ``v_dot = mu - lambda`` rule in
-        the notes: integrating ``mu - lambda`` only produces the right dead zone
-        for non-negative currents.  Shrinking the current instead gives the exact
-        soft-threshold f-I curve for both signs.
+        Shrinking the current (rather than integrating u - lam1 and clipping)
+        gives the right dead zone for both signs, not just positive currents.
         """
         if self.nonneg:
             return np.maximum(u - self.lam1, 0.0)
         return np.sign(u) * np.maximum(np.abs(u) - self.lam1, 0.0)
 
-    # ---- diagnostics ------------------------------------------------------- #
+    def activation(self, u):
+        """Readout a = shrink(u, lam1) / nu_f."""
+        return self.drive(u) / self.nu_f
+
+    # ---- spectrum, used to pick step sizes ---------------------------------
     def spectrum(self):
-        ev = np.linalg.eigvalsh(self.Q + 2.0 * np.diag((self.nu_f - 1.0) / 2.0))
+        # Effective Gram matrix including the l2 shift: Q + 2*lam2*I
+        ev = np.linalg.eigvalsh(self.Q + np.diag(self.nu_f - 1.0))
         lo, hi = float(ev.min()), float(ev.max())
         return {
             "lambda_min": lo,
@@ -106,18 +100,17 @@ class NetworkSpec:
 
 
 def normalize(prob: CanonicalProblem, atol: float = 1e-9):
-    """Rescale variables so that ``diag(Q) = 1``.
+    """Rescale variables so diag(Q) = 1.
 
-    With ``x = S x_tilde``, ``S = diag(diag(Q)^{-1/2})``:
+    With x = S x~ and S = diag(Q)^(-1/2):
 
-        Q~ = S Q S     (unit diagonal)      c~ = S c
-        lam1~ = S lam1                      lam2~ = S^2 lam2
-        A~ = A S                            k~ = k
+        Q~ = S Q S      c~ = S c      lam1~ = S lam1      lam2~ = S^2 lam2
+        A~ = A S        k~ = k
 
-    The l1 weight becomes per-coordinate even if it started scalar, which is why
-    the whole library carries vector ``lam1``/``lam2``.  Without this step the
-    ``-I`` in ``(Q - I)`` fails to cancel self-inhibition and each neuron ends up
-    with an effective threshold ``lam1_i / Q_ii``.
+    Note lam1 becomes per-coordinate even if it started out scalar, which is
+    why lam1/lam2 are vectors throughout the library.
+
+    Returns (new_problem, scaling, did_anything).
     """
     d = np.diag(prob.Q).copy()
     if np.allclose(d, 1.0, atol=atol):
@@ -125,41 +118,40 @@ def normalize(prob: CanonicalProblem, atol: float = 1e-9):
 
     s = np.ones(prob.n)
     pos = d > 0
-    s[pos] = 1.0 / np.sqrt(d[pos])  # scale factor applied to the *network* var
+    s[pos] = 1.0 / np.sqrt(d[pos])
     S = np.diag(s)
 
     new = CanonicalProblem(
         Q=S @ prob.Q @ S,
         c=s * prob.c,
         lam1=s * prob.lam1,
-        lam2=(s**2) * prob.lam2,
+        lam2=(s ** 2) * prob.lam2,
         A=None if prob.A is None else prob.A @ S,
         k=prob.k,
         nonneg=prob.nonneg,
         source=None,
     )
+    # Pin the diagonal to exactly 1 where we could; floating point otherwise
+    # leaves it at 0.99999999.
     np.fill_diagonal(new.Q, np.where(pos, 1.0, np.diag(new.Q)))
     return new, Scaling(s), True
 
 
 def compile_network(prob: CanonicalProblem, auto_normalize: bool = True) -> NetworkSpec:
-    """Map a canonical problem onto neurons, weights and thresholds."""
-    scaling = Scaling(np.ones(prob.n))
-    normalized = False
+    """Map a canonical problem onto neurons."""
     if auto_normalize:
         prob_n, scaling, normalized = normalize(prob)
     else:
-        prob_n = prob
-        d = np.diag(prob.Q)
-        if not np.allclose(d, 1.0, atol=1e-6):
+        if not np.allclose(np.diag(prob.Q), 1.0, atol=1e-6):
             raise ValueError(
-                "diag(Q) != 1 and auto_normalize=False; the -I self-inhibition "
-                "cancellation is invalid.  Normalise the dictionary atoms or let "
-                "the compiler rescale."
+                "diag(Q) != 1 with auto_normalize=False. The self-inhibition "
+                "cancellation in W = I - Q won't hold. Either normalise your "
+                "dictionary columns or let the compiler rescale."
             )
+        prob_n, scaling, normalized = prob, Scaling(np.ones(prob.n)), False
 
     W = np.eye(prob_n.n) - prob_n.Q
-    np.fill_diagonal(W, 0.0)  # a neuron never synapses onto itself
+    np.fill_diagonal(W, 0.0)   # never a synapse onto itself
 
     return NetworkSpec(
         W=W,
