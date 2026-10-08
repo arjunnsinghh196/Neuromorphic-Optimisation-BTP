@@ -1,273 +1,187 @@
 """
-How a problem is written down.
+Problem definition.
 
-You build a problem as a sum of terms plus a list of constraints. Everything
-then gets reduced to one canonical form that all the solvers understand:
+Everything reduces to one canonical form:
 
-    minimize   1/2 x'Qx + c'x + sum_i lam1_i |x_i| + sum_i lam2_i x_i^2
-    s.t.       A x <= k
-               x >= 0          (optional)
-
-That's the widest class where the objective-to-neuron mapping is exact, so
-anything outside it is rejected at canonicalize() time rather than silently
-approximated.
+    min  1/2 x'Gx + h'x + l1_weight'|x| + l2_weight'x^2
+    s.t. constraint_matrix x <= constraint_rhs,  x >= 0 (optional)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
 
 import numpy as np
 
-__all__ = [
-    "Term", "Quadratic", "LeastSquares", "L1", "L2Squared",
-    "Constraint", "LinearInequality", "NonNegative", "Box",
-    "Problem", "CanonicalProblem",
-]
 
-
-# ---------------------------------------------------------------------------
-# objective terms
-# ---------------------------------------------------------------------------
 class Term:
-    """Base class for objective terms. Terms add together into a Problem."""
+    size: int | None = None
 
-    n: int
-
-    def __add__(self, other: "Term") -> "Problem":
+    def __add__(self, other):
         return Problem([self]) + other
-
-    def __radd__(self, other):
-        # lets sum([...]) work, since sum starts from 0
-        if other == 0:
-            return Problem([self])
-        return NotImplemented
 
 
 class Quadratic(Term):
-    """1/2 x'Qx + c'x, with Q symmetric PSD."""
+    """1/2 x'Gx + h'x with G symmetric positive semi-definite."""
 
-    smooth = True
+    def __init__(self, gram, linear=None):
+        gram = np.asarray(gram, dtype=float)
+        if gram.ndim != 2 or gram.shape[0] != gram.shape[1]:
+            raise ValueError("gram must be square")
+        if not np.allclose(gram, gram.T, atol=1e-10):
+            gram = (gram + gram.T) / 2
 
-    def __init__(self, Q: np.ndarray, c: Optional[np.ndarray] = None):
-        Q = np.asarray(Q, dtype=float)
-        if Q.ndim != 2 or Q.shape[0] != Q.shape[1]:
-            raise ValueError("Q must be a square matrix")
+        self.gram = gram
+        self.size = len(gram)
+        self.linear = np.zeros(self.size) if linear is None else np.asarray(linear, dtype=float).ravel()
+        if self.linear.shape != (self.size,):
+            raise ValueError(f"linear must have length {self.size}")
 
-        # Only the symmetric part contributes to x'Qx, so just symmetrise.
-        if not np.allclose(Q, Q.T, atol=1e-10):
-            Q = 0.5 * (Q + Q.T)
-
-        self.Q = Q
-        self.n = Q.shape[0]
-        self.c = np.zeros(self.n) if c is None else np.asarray(c, dtype=float).ravel()
-        if self.c.shape != (self.n,):
-            raise ValueError(f"c should have length {self.n}, got {self.c.shape}")
-
-        # Non-convex Q means the gradient flow can run away. Catch it early.
-        w = np.linalg.eigvalsh(self.Q)
-        if w.min() < -1e-8 * max(1.0, abs(w).max()):
-            raise ValueError(
-                f"Q is not positive semi-definite (smallest eigenvalue {w.min():.3e}). "
-                "The problem is non-convex and none of the solvers here will work."
-            )
+        eigenvalues = np.linalg.eigvalsh(gram)
+        if eigenvalues.min() < -1e-8 * max(1.0, abs(eigenvalues).max()):
+            raise ValueError(f"gram is not PSD (min eigenvalue {eigenvalues.min():.3e})")
 
     def value(self, x):
-        return 0.5 * x @ self.Q @ x + self.c @ x
-
-    def grad(self, x):
-        return self.Q @ x + self.c
+        return 0.5 * x @ self.gram @ x + self.linear @ x
 
 
 class LeastSquares(Quadratic):
-    """1/2 ||s - Phi a||^2, which is just Q = Phi'Phi and c = -Phi's."""
+    """1/2 ||signal - dictionary @ x||^2"""
 
-    def __init__(self, Phi: np.ndarray, s: np.ndarray, normalize_atoms: bool = False):
-        Phi = np.asarray(Phi, dtype=float)
-        s = np.asarray(s, dtype=float).ravel()
-        if Phi.shape[0] != s.shape[0]:
-            raise ValueError(
-                f"Phi has {Phi.shape[0]} rows but s has {s.shape[0]} entries"
-            )
+    def __init__(self, dictionary, signal):
+        dictionary = np.asarray(dictionary, dtype=float)
+        signal = np.asarray(signal, dtype=float).ravel()
+        if dictionary.shape[0] != signal.shape[0]:
+            raise ValueError(f"dictionary has {dictionary.shape[0]} rows, signal has {len(signal)}")
 
-        self.atom_norms = np.linalg.norm(Phi, axis=0)
-        if normalize_atoms:
-            if np.any(self.atom_norms == 0):
-                raise ValueError("dictionary has a zero column, can't normalise it")
-            Phi = Phi / self.atom_norms
-
-        self.Phi = Phi
-        self.s = s
-        super().__init__(Phi.T @ Phi, -(Phi.T @ s))
+        self.dictionary = dictionary
+        self.signal = signal
+        super().__init__(dictionary.T @ dictionary, -dictionary.T @ signal)
 
     def value(self, x):
-        # Evaluate in the original form; it's better conditioned than x'Qx.
-        return 0.5 * np.sum((self.s - self.Phi @ x) ** 2)
+        return 0.5 * np.sum((self.signal - self.dictionary @ x) ** 2)
 
 
 class L1(Term):
-    """lam * ||x||_1. lam can be a scalar or one value per coordinate."""
+    """weight * ||x||_1"""
 
-    smooth = False
-
-    def __init__(self, lam, n: Optional[int] = None):
-        self.lam = np.asarray(lam, dtype=float)
-        self.n = n if n is not None else (self.lam.size if self.lam.ndim else None)
+    def __init__(self, weight, size=None):
+        self.weight = np.asarray(weight, dtype=float)
+        self.size = size or (self.weight.size if self.weight.ndim else None)
 
     def value(self, x):
-        return float(np.sum(np.broadcast_to(self.lam, x.shape) * np.abs(x)))
+        return float(np.sum(self.weight * np.abs(x)))
 
 
 class L2Squared(Term):
-    """lam * ||x||_2^2 - note the square.
+    """weight * ||x||_2^2"""
 
-    The unsquared norm has a completely different prox (it zeroes the whole
-    vector at once) and needs a different neuron, so it isn't supported. The
-    name is deliberately explicit so nobody reaches for it by accident.
-    """
-
-    smooth = True
-
-    def __init__(self, lam, n: Optional[int] = None):
-        self.lam = np.asarray(lam, dtype=float)
-        self.n = n if n is not None else (self.lam.size if self.lam.ndim else None)
+    def __init__(self, weight, size=None):
+        self.weight = np.asarray(weight, dtype=float)
+        self.size = size or (self.weight.size if self.weight.ndim else None)
 
     def value(self, x):
-        return float(np.sum(np.broadcast_to(self.lam, x.shape) * x ** 2))
-
-    def grad(self, x):
-        return 2.0 * np.broadcast_to(self.lam, x.shape) * x
+        return float(np.sum(self.weight * x**2))
 
 
-# ---------------------------------------------------------------------------
-# constraints
-# ---------------------------------------------------------------------------
 class Constraint:
-    pass
+    size: int | None = None
 
 
 class LinearInequality(Constraint):
-    """A x <= k."""
+    """matrix @ x <= rhs"""
 
-    def __init__(self, A: np.ndarray, k: np.ndarray):
-        self.A = np.atleast_2d(np.asarray(A, dtype=float))
-        self.k = np.asarray(k, dtype=float).ravel()
-        if self.A.shape[0] != self.k.shape[0]:
-            raise ValueError(
-                f"A has {self.A.shape[0]} rows but k has {self.k.shape[0]} entries"
-            )
-        self.n = self.A.shape[1]
+    def __init__(self, matrix, rhs):
+        self.matrix = np.atleast_2d(np.asarray(matrix, dtype=float))
+        self.rhs = np.asarray(rhs, dtype=float).ravel()
+        if self.matrix.shape[0] != len(self.rhs):
+            raise ValueError(f"matrix has {self.matrix.shape[0]} rows, rhs has {len(self.rhs)}")
+        self.size = self.matrix.shape[1]
 
 
 class NonNegative(Constraint):
-    """x >= 0. Baked into the neuron (rectifier), not sent to the dual layer."""
+    """x >= 0"""
 
-    def __init__(self, n: Optional[int] = None):
-        self.n = n
+    def __init__(self, size=None):
+        self.size = size
 
 
 class Box(Constraint):
-    """lo <= x <= hi. Turned into plain linear inequalities when canonicalised."""
+    """low <= x <= high"""
 
-    def __init__(self, lo=None, hi=None, n: Optional[int] = None):
-        self.lo, self.hi, self.n = lo, hi, n
+    def __init__(self, low=None, high=None, size=None):
+        self.low, self.high, self.size = low, high, size
 
-    def expand(self, n: int) -> LinearInequality:
+    def as_inequality(self, size):
         rows, rhs = [], []
-        eye = np.eye(n)
-        if self.hi is not None:
-            rows.append(eye)
-            rhs.append(np.broadcast_to(np.asarray(self.hi, dtype=float), (n,)))
-        if self.lo is not None:
-            rows.append(-eye)
-            rhs.append(-np.broadcast_to(np.asarray(self.lo, dtype=float), (n,)))
+        if self.high is not None:
+            rows.append(np.eye(size))
+            rhs.append(np.broadcast_to(np.asarray(self.high, dtype=float), size))
+        if self.low is not None:
+            rows.append(-np.eye(size))
+            rhs.append(-np.broadcast_to(np.asarray(self.low, dtype=float), size))
         if not rows:
-            raise ValueError("Box needs at least one of lo or hi")
+            raise ValueError("Box needs low or high")
         return LinearInequality(np.vstack(rows), np.concatenate(rhs))
 
 
-# ---------------------------------------------------------------------------
-# canonical form
-# ---------------------------------------------------------------------------
 @dataclass
 class CanonicalProblem:
-    """The one form every solver accepts. See the module docstring."""
-
-    Q: np.ndarray
-    c: np.ndarray
-    lam1: np.ndarray
-    lam2: np.ndarray
-    A: Optional[np.ndarray] = None
-    k: Optional[np.ndarray] = None
+    gram: np.ndarray
+    linear: np.ndarray
+    l1_weight: np.ndarray
+    l2_weight: np.ndarray
+    constraint_matrix: np.ndarray | None = None
+    constraint_rhs: np.ndarray | None = None
     nonneg: bool = False
-    source: Optional["Problem"] = field(default=None, repr=False)
+    source: Problem | None = field(default=None, repr=False)
 
     @property
-    def n(self) -> int:
-        return self.Q.shape[0]
+    def size(self):
+        return len(self.gram)
 
     @property
-    def m(self) -> int:
-        return 0 if self.A is None else self.A.shape[0]
+    def n_constraints(self):
+        return 0 if self.constraint_matrix is None else len(self.constraint_matrix)
 
     @property
-    def constrained(self) -> bool:
-        return self.A is not None
+    def constrained(self):
+        return self.constraint_matrix is not None
 
-    # ---- evaluation --------------------------------------------------------
-    def smooth_grad(self, x):
-        """Gradient of the smooth part (everything except the l1 term)."""
-        return self.Q @ x + self.c + 2.0 * self.lam2 * x
+    def smooth_gradient(self, x):
+        return self.gram @ x + self.linear + 2 * self.l2_weight * x
 
     def objective(self, x):
-        # Prefer the original terms if we have them; LeastSquares evaluates
-        # more accurately in its own form than via Q.
         if self.source is not None:
             return self.source.objective(x)
-        return (
-            0.5 * x @ self.Q @ x
-            + self.c @ x
-            + np.sum(self.lam1 * np.abs(x))
-            + np.sum(self.lam2 * x ** 2)
-        )
+        return (0.5 * x @ self.gram @ x + self.linear @ x
+                + np.sum(self.l1_weight * np.abs(x)) + np.sum(self.l2_weight * x**2))
 
     def violation(self, x):
-        """Largest constraint violation; 0 if x is feasible."""
-        v = 0.0
-        if self.A is not None:
-            v = max(v, float(np.max(self.A @ x - self.k, initial=0.0)))
+        worst = 0.0
+        if self.constraint_matrix is not None:
+            worst = max(worst, float(np.max(self.constraint_matrix @ x - self.constraint_rhs, initial=0.0)))
         if self.nonneg:
-            v = max(v, float(np.max(-x, initial=0.0)))
-        return v
+            worst = max(worst, float(np.max(-x, initial=0.0)))
+        return worst
 
-    def kkt_residual(self, x, y=None):
-        """How far x is from satisfying the optimality conditions.
-
-        For coordinates that are zero, the subgradient of |x| is the whole
-        interval [-lam1, lam1], so the residual is the distance of -g to that
-        interval. For non-zero coordinates it's simply |g + lam1 * sign(x)|.
-        Pass y (dual multipliers) if the problem has constraints.
-        """
-        g = self.smooth_grad(x)
-        if y is not None and self.A is not None:
-            g = g + self.A.T @ y
+    def kkt_residual(self, x, multipliers=None):
+        gradient = self.smooth_gradient(x)
+        if multipliers is not None and self.constraint_matrix is not None:
+            gradient = gradient + self.constraint_matrix.T @ multipliers
 
         active = np.abs(x) > 1e-12
-        r = np.empty_like(g)
-        r[active] = g[active] + self.lam1[active] * np.sign(x[active])
-        r[~active] = np.maximum(np.abs(g[~active]) - self.lam1[~active], 0.0)
-        return float(np.linalg.norm(r))
+        residual = np.empty_like(gradient)
+        residual[active] = gradient[active] + self.l1_weight[active] * np.sign(x[active])
+        residual[~active] = np.maximum(np.abs(gradient[~active]) - self.l1_weight[~active], 0.0)
+        return float(np.linalg.norm(residual))
 
 
 class Problem:
-    """A list of terms and a list of constraints, nothing more."""
+    def __init__(self, terms, constraints=()):
+        self.terms = list(terms)
+        self.constraints = list(constraints)
 
-    def __init__(self, terms: Sequence[Term], constraints: Sequence[Constraint] = ()):
-        self.terms: List[Term] = list(terms)
-        self.constraints: List[Constraint] = list(constraints)
-
-    # ---- composition -------------------------------------------------------
     def __add__(self, other):
         if isinstance(other, Problem):
             return Problem(self.terms + other.terms, self.constraints + other.constraints)
@@ -277,64 +191,54 @@ class Problem:
             return Problem(self.terms, self.constraints + [other])
         return NotImplemented
 
-    def subject_to(self, *constraints: Constraint) -> "Problem":
+    def subject_to(self, *constraints):
         return Problem(self.terms, self.constraints + list(constraints))
 
-    # ---- evaluation --------------------------------------------------------
     def objective(self, x):
         x = np.asarray(x, dtype=float)
-        return float(sum(t.value(x) for t in self.terms))
+        return float(sum(term.value(x) for term in self.terms))
 
-    # ---- reduction ---------------------------------------------------------
-    def _infer_dimension(self) -> int:
-        for t in self.terms:
-            if getattr(t, "n", None):
-                return t.n
-        for con in self.constraints:
-            if getattr(con, "n", None):
-                return con.n
-        raise ValueError(
-            "couldn't work out the problem dimension; pass n= to one of the terms"
-        )
+    def canonicalize(self):
+        size = next((obj.size for obj in self.terms + self.constraints if obj.size), None)
+        if size is None:
+            raise ValueError("can't infer problem size; pass size= to a term")
 
-    def canonicalize(self) -> CanonicalProblem:
-        n = self._infer_dimension()
+        gram = np.zeros((size, size))
+        linear = np.zeros(size)
+        l1_weight = np.zeros(size)
+        l2_weight = np.zeros(size)
 
-        Q = np.zeros((n, n))
-        c = np.zeros(n)
-        lam1 = np.zeros(n)
-        lam2 = np.zeros(n)
-
-        for t in self.terms:
-            if isinstance(t, Quadratic):
-                Q += t.Q
-                c += t.c
-            elif isinstance(t, L1):
-                lam1 += np.broadcast_to(t.lam, (n,))
-            elif isinstance(t, L2Squared):
-                lam2 += np.broadcast_to(t.lam, (n,))
+        for term in self.terms:
+            if isinstance(term, Quadratic):
+                gram += term.gram
+                linear += term.linear
+            elif isinstance(term, L1):
+                l1_weight += np.broadcast_to(term.weight, size)
+            elif isinstance(term, L2Squared):
+                l2_weight += np.broadcast_to(term.weight, size)
             else:
-                raise TypeError(f"don't know how to handle term {type(t).__name__}")
+                raise TypeError(f"unsupported term {type(term).__name__}")
 
-        if np.any(lam1 < 0) or np.any(lam2 < 0):
-            raise ValueError("regularisation weights have to be >= 0")
+        if (l1_weight < 0).any() or (l2_weight < 0).any():
+            raise ValueError("regularisation weights must be >= 0")
 
         rows, rhs, nonneg = [], [], False
-        for con in self.constraints:
-            if isinstance(con, Box):
-                con = con.expand(n)
-            if isinstance(con, LinearInequality):
-                if con.A.shape[1] != n:
-                    raise ValueError(
-                        f"constraint has {con.A.shape[1]} columns, problem has {n} variables"
-                    )
-                rows.append(con.A)
-                rhs.append(con.k)
-            elif isinstance(con, NonNegative):
+        for constraint in self.constraints:
+            if isinstance(constraint, Box):
+                constraint = constraint.as_inequality(size)
+            if isinstance(constraint, LinearInequality):
+                if constraint.matrix.shape[1] != size:
+                    raise ValueError(f"constraint has {constraint.matrix.shape[1]} columns, problem has {size}")
+                rows.append(constraint.matrix)
+                rhs.append(constraint.rhs)
+            elif isinstance(constraint, NonNegative):
                 nonneg = True
             else:
-                raise TypeError(f"don't know how to handle constraint {type(con).__name__}")
+                raise TypeError(f"unsupported constraint {type(constraint).__name__}")
 
-        A = np.vstack(rows) if rows else None
-        k = np.concatenate(rhs) if rhs else None
-        return CanonicalProblem(Q, c, lam1, lam2, A, k, nonneg, source=self)
+        return CanonicalProblem(
+            gram, linear, l1_weight, l2_weight,
+            np.vstack(rows) if rows else None,
+            np.concatenate(rhs) if rhs else None,
+            nonneg, source=self,
+        )

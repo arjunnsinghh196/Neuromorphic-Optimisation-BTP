@@ -1,37 +1,28 @@
 """
-Solver backends.
+Solver backends. All take a CanonicalProblem and return a Result.
 
-All four take the same CanonicalProblem so you can compare them on identical
-inputs:
-
-    reference   SLSQP on a smooth reformulation. Ground truth for tests.
-    ista        proximal gradient (or FISTA). The textbook baseline.
-    analog      the continuous-time network, integrated numerically.
-    spiking     the same network with integrate-and-fire neurons.
-
-ista with step 1 is literally forward Euler on the analog dynamics, and the
-spiking run time-averages to the same fixed point.
+    reference  SciPy SLSQP, exact, used to check the others
+    ista       proximal gradient (accelerate=True gives FISTA)
+    analog     the network ODE integrated with Euler
+    spiking    the same network with integrate-and-fire neurons
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from .compile import NetworkSpec, compile_network
-from .objectives import CanonicalProblem
-
-__all__ = ["Result", "solve_reference", "solve_ista", "solve_analog", "solve_spiking"]
+from .compile import compile_network
 
 
-# ---------------------------------------------------------------------------
 @dataclass
 class Result:
-    x: np.ndarray
-    y: Optional[np.ndarray] = None          # dual multipliers, if constrained
+    x: np.ndarray                        # solution, small values set to zero
+    x_raw: np.ndarray                    # solution before truncation
+    active_threshold: float              # |x| below this counts as inactive
+    multipliers: np.ndarray | None = None
     objective: float = np.nan
     violation: float = 0.0
     kkt_residual: float = np.nan
@@ -39,458 +30,390 @@ class Result:
     iterations: int = 0
     solver: str = ""
     wall_time_s: float = 0.0
-    history: Dict[str, List[float]] = field(default_factory=dict, repr=False)
-    stats: Dict[str, Any] = field(default_factory=dict)
-    support_tol: float = 1e-9
+    history: dict = field(default_factory=dict, repr=False)
+    stats: dict = field(default_factory=dict)
 
     @property
-    def support(self):
-        """Indices we're calling non-zero.
+    def active(self):
+        return np.flatnonzero(self.x != 0)
 
-        A spiking readout is never exactly sparse - a neuron that fires once in
-        a while still has a tiny rate. Each backend sets support_tol to its own
-        noise floor so "sparsity" means the same thing everywhere. If you want
-        the strict physical count, look at stats['never_spiked_fraction'].
-        """
-        return np.flatnonzero(np.abs(self.x) > self.support_tol)
+    @property
+    def n_active(self):
+        return len(self.active)
 
     @property
     def sparsity(self):
-        return 1.0 - len(self.support) / max(self.x.size, 1)
+        return 1 - self.n_active / max(self.x.size, 1)
 
-    def summary(self) -> str:
+    def summary(self):
         lines = [
-            f"solver          : {self.solver}",
-            f"objective       : {self.objective:.10g}",
-            f"KKT residual    : {self.kkt_residual:.3e}",
-            f"max violation   : {self.violation:.3e}",
-            f"converged       : {self.converged}  ({self.iterations} iterations)",
-            f"sparsity        : {self.sparsity:.1%} "
-            f"({len(self.support)}/{self.x.size} active)",
-            f"wall time       : {self.wall_time_s * 1e3:.1f} ms",
+            f"solver           : {self.solver}",
+            f"objective        : {self.objective:.10g}",
+            f"KKT residual     : {self.kkt_residual:.3e}",
+            f"max violation    : {self.violation:.3e}",
+            f"converged        : {self.converged}  ({self.iterations} iterations)",
+            f"active threshold : {self.active_threshold:.2e}",
+            f"active neurons   : {self.n_active}/{self.x.size}  ({self.sparsity:.0%} sparse)",
+            f"wall time        : {self.wall_time_s * 1e3:.1f} ms",
         ]
-        for key in ("total_spikes", "spikes_per_neuron", "active_fraction",
-                    "spike_resolution", "synaptic_events", "readout_rate_vs_analog"):
+        for key in ("total_spikes", "spikes_per_neuron", "spikes_per_unit", "synaptic_events", "flops"):
             if key in self.stats:
-                v = self.stats[key]
-                lines.append(f"{key:<16}: {v:.4g}" if isinstance(v, float)
-                             else f"{key:<16}: {v}")
+                lines.append(f"{key:<17}: {self.stats[key]:.4g}")
         return "\n".join(lines)
 
 
-def _finish(res: Result, prob: CanonicalProblem) -> Result:
-    """Fill in the quality numbers every backend reports."""
-    res.objective = float(prob.objective(res.x))
-    res.violation = prob.violation(res.x)
-    res.kkt_residual = prob.kkt_residual(res.x, res.y)
-    return res
+def _finish(result, problem):
+    result.objective = float(problem.objective(result.x))
+    result.violation = problem.violation(result.x)
+    result.kkt_residual = problem.kkt_residual(result.x, result.multipliers)
+    return result
 
 
-def _prox(v, lam1, lam2, step, nonneg):
-    """Prox of step * (lam1 |x| + lam2 x^2), evaluated at v."""
+def _make_result(x_raw, problem, active_threshold, **fields):
+    x = np.where(np.abs(x_raw) > active_threshold, x_raw, 0.0)
+    return _finish(Result(x=x, x_raw=x_raw, active_threshold=active_threshold, **fields), problem)
+
+
+def _prox(v, l1_weight, l2_weight, step, nonneg):
     if nonneg:
-        t = np.maximum(v - step * lam1, 0.0)
+        shrunk = np.maximum(v - step * l1_weight, 0.0)
     else:
-        t = np.sign(v) * np.maximum(np.abs(v) - step * lam1, 0.0)
-    return t / (1.0 + 2.0 * step * lam2)
+        shrunk = np.sign(v) * np.maximum(np.abs(v) - step * l1_weight, 0.0)
+    return shrunk / (1 + 2 * step * l2_weight)
 
 
-def _default_dual_gain(spec: NetworkSpec) -> Optional[float]:
-    """Scale the dual step by the largest eigenvalue of A A' so it can't blow up."""
-    if not spec.m:
+def _dual_gain(network):
+    if not network.n_constraints:
         return None
-    return 1.0 / max(1.0, float(np.linalg.eigvalsh(spec.A @ spec.A.T).max()))
+    A = network.constraint_matrix
+    return 1 / max(1.0, float(np.linalg.eigvalsh(A @ A.T).max()))
 
 
-# ---------------------------------------------------------------------------
-# 1. reference
-# ---------------------------------------------------------------------------
-def solve_reference(prob: CanonicalProblem, tol: float = 1e-12,
-                    max_iter: int = 2000) -> Result:
-    """High-accuracy digital solve, for validation only.
-
-    Splits x = p - q with p, q >= 0 so the l1 term becomes linear, then hands
-    the smooth constrained problem to SLSQP.
-    """
+# --------------------------------------------------------------------------- #
+# reference
+# --------------------------------------------------------------------------- #
+def solve_reference(problem, tol=1e-12, max_iter=2000, active_threshold=1e-9):
+    """SLSQP on x = plus - minus with plus, minus >= 0, which makes the l1 term linear."""
     from scipy.optimize import LinearConstraint, minimize
 
-    t0 = time.perf_counter()
-    n = prob.n
+    start = time.perf_counter()
+    n = problem.size
 
-    def unpack(z):
-        return z[:n] - z[n:]
+    def objective(z):
+        x = z[:n] - z[n:]
+        return (0.5 * x @ problem.gram @ x + problem.linear @ x
+                + problem.l1_weight @ (z[:n] + z[n:]) + problem.l2_weight @ x**2)
 
-    def f(z):
-        x = unpack(z)
-        return (0.5 * x @ prob.Q @ x + prob.c @ x
-                + prob.lam1 @ (z[:n] + z[n:]) + prob.lam2 @ (x * x))
+    def gradient(z):
+        x = z[:n] - z[n:]
+        g = problem.gram @ x + problem.linear + 2 * problem.l2_weight * x
+        return np.concatenate([g + problem.l1_weight, -g + problem.l1_weight])
 
-    def g(z):
-        x = unpack(z)
-        gx = prob.Q @ x + prob.c + 2.0 * prob.lam2 * x
-        return np.concatenate([gx + prob.lam1, -gx + prob.lam1])
+    constraints = []
+    if problem.constraint_matrix is not None:
+        A = problem.constraint_matrix
+        constraints.append(LinearConstraint(np.hstack([A, -A]), -np.inf, problem.constraint_rhs))
+    if problem.nonneg:
+        constraints.append(LinearConstraint(np.hstack([-np.eye(n), np.eye(n)]), -np.inf, 0.0))
 
-    cons = []
-    if prob.A is not None:
-        cons.append(LinearConstraint(np.hstack([prob.A, -prob.A]), -np.inf, prob.k))
-    if prob.nonneg:
-        cons.append(LinearConstraint(np.hstack([-np.eye(n), np.eye(n)]), -np.inf, 0.0))
-
-    out = minimize(f, np.zeros(2 * n), jac=g, bounds=[(0, None)] * (2 * n),
-                   constraints=cons, method="SLSQP",
+    out = minimize(objective, np.zeros(2 * n), jac=gradient, bounds=[(0, None)] * (2 * n),
+                   constraints=constraints, method="SLSQP",
                    options={"maxiter": max_iter, "ftol": tol})
+    x_raw = out.x[:n] - out.x[n:]
 
-    res = Result(x=unpack(out.x), converged=bool(out.success),
-                 iterations=int(out.nit), solver="reference(SLSQP)",
-                 wall_time_s=time.perf_counter() - t0)
-    if prob.A is not None:
-        res.y = _recover_duals(prob, res.x)
-    return _finish(res, prob)
+    multipliers = _recover_multipliers(problem, x_raw) if problem.constraint_matrix is not None else None
+    return _make_result(x_raw, problem, active_threshold, multipliers=multipliers,
+                        converged=bool(out.success), iterations=int(out.nit),
+                        solver="reference(SLSQP)", wall_time_s=time.perf_counter() - start,
+                        stats={"flops": np.nan})
 
 
-def _recover_duals(prob: CanonicalProblem, x, tol=1e-7):
-    """Back out y >= 0 from stationarity, using only the active constraints."""
-    g = prob.smooth_grad(x)
-    sub = np.where(np.abs(x) > tol, prob.lam1 * np.sign(x), 0.0)
-    rhs = -(g + sub)
-    active = np.flatnonzero(prob.A @ x - prob.k > -1e-6)
-    y = np.zeros(prob.m)
+def _recover_multipliers(problem, x, tol=1e-7):
+    gradient = problem.smooth_gradient(x)
+    subgradient = np.where(np.abs(x) > tol, problem.l1_weight * np.sign(x), 0.0)
+    A, rhs = problem.constraint_matrix, problem.constraint_rhs
+    active = np.flatnonzero(A @ x - rhs > -1e-6)
+    multipliers = np.zeros(problem.n_constraints)
     if active.size:
-        sol, *_ = np.linalg.lstsq(prob.A[active].T, rhs, rcond=None)
-        y[active] = np.maximum(sol, 0.0)
-    return y
+        solution, *_ = np.linalg.lstsq(A[active].T, -(gradient + subgradient), rcond=None)
+        multipliers[active] = np.maximum(solution, 0.0)
+    return multipliers
 
 
-# ---------------------------------------------------------------------------
-# 2. ISTA / FISTA
-# ---------------------------------------------------------------------------
-def solve_ista(prob: CanonicalProblem, step: Optional[float] = None,
-               accelerate: bool = False, max_iter: int = 5000,
-               tol: float = 1e-10, record_every: int = 10) -> Result:
-    """Proximal gradient descent. Unconstrained problems only.
+# --------------------------------------------------------------------------- #
+# ISTA / FISTA
+# --------------------------------------------------------------------------- #
+def solve_ista(problem, step=None, accelerate=False, max_iter=5000, tol=1e-10,
+               record_every=10, x0=None, active_threshold=1e-9):
+    if problem.constraint_matrix is not None:
+        raise ValueError("ista doesn't support linear constraints")
 
-    With step = 1 and diag(Q) = 1 this is forward Euler on the analog network:
-    u = (I - Q)a - c is the membrane potential and each iteration does
-    u <- u + u'. The usual 1/lambda_max step is the same iteration on a rescaled
-    dictionary - the step limit is a discretisation artefact, not something the
-    underlying flow cares about.
-    """
-    if prob.A is not None:
-        raise ValueError("ISTA can't handle linear inequality constraints; "
-                         "use backend='analog' or 'spiking'.")
+    start = time.perf_counter()
+    n = problem.size
+    lipschitz = float(np.linalg.eigvalsh(problem.gram).max())
+    step = step or 1 / max(lipschitz, 1e-12)
 
-    t0 = time.perf_counter()
-    L = float(np.linalg.eigvalsh(prob.Q).max())
-    if step is None:
-        step = 1.0 / max(L, 1e-12)
-
-    x = np.zeros(prob.n)
-    z, t_k = x.copy(), 1.0
-    hist = {"iteration": [], "objective": [], "kkt_residual": []}
+    x = np.zeros(n) if x0 is None else np.asarray(x0, dtype=float).copy()
+    lookahead = x.copy()
+    momentum = 1.0
+    history = {"iteration": [], "objective": [], "kkt_residual": []}
     converged = False
-    it = 0
 
-    for it in range(1, max_iter + 1):
-        x_new = _prox(z - step * (prob.Q @ z + prob.c),
-                      prob.lam1, prob.lam2, step, prob.nonneg)
+    for iteration in range(1, max_iter + 1):
+        gradient = problem.gram @ lookahead + problem.linear
+        x_new = _prox(lookahead - step * gradient, problem.l1_weight, problem.l2_weight, step, problem.nonneg)
 
         if accelerate:
-            # Nesterov momentum, standard FISTA schedule
-            t_next = 0.5 * (1 + np.sqrt(1 + 4 * t_k * t_k))
-            z = x_new + ((t_k - 1) / t_next) * (x_new - x)
-            t_k = t_next
+            momentum_new = (1 + np.sqrt(1 + 4 * momentum**2)) / 2
+            lookahead = x_new + (momentum - 1) / momentum_new * (x_new - x)
+            momentum = momentum_new
         else:
-            z = x_new
+            lookahead = x_new
 
-        delta = np.linalg.norm(x_new - x)
+        change = np.linalg.norm(x_new - x)
         x = x_new
 
-        if it % record_every == 0 or it == 1:
-            hist["iteration"].append(it)
-            hist["objective"].append(float(prob.objective(x)))
-            hist["kkt_residual"].append(prob.kkt_residual(x))
+        if iteration == 1 or iteration % record_every == 0:
+            history["iteration"].append(iteration)
+            history["objective"].append(float(problem.objective(x)))
+            history["kkt_residual"].append(problem.kkt_residual(x))
 
-        if delta <= tol * max(1.0, np.linalg.norm(x)):
+        if change <= tol * max(1.0, np.linalg.norm(x)):
             converged = True
             break
 
-    res = Result(x=x, converged=converged, iterations=it,
-                 solver="FISTA" if accelerate else "ISTA",
-                 wall_time_s=time.perf_counter() - t0, history=hist,
-                 stats={"step_size": step, "lambda_max": L,
-                        "unit_step_stable": bool(L < 2.0)})
-    return _finish(res, prob)
+    # one matrix-vector product per iteration: 2 n^2 flops
+    flops = iteration * (2 * n * n + 8 * n)
+    return _make_result(x, problem, active_threshold, converged=converged, iterations=iteration,
+                        solver="FISTA" if accelerate else "ISTA",
+                        wall_time_s=time.perf_counter() - start, history=history,
+                        stats={"step": step, "lambda_max": lipschitz, "flops": flops})
 
 
-# ---------------------------------------------------------------------------
-# 3. analog network
-# ---------------------------------------------------------------------------
-def solve_analog(prob: CanonicalProblem, dt: Optional[float] = None,
-                 t_max: float = 200.0, dual_gain: Optional[float] = None,
-                 tol: float = 1e-10, record_every: int = 20,
-                 integrator: str = "euler",
-                 spec: Optional[NetworkSpec] = None) -> Result:
-    """Integrate the continuous-time network numerically.
+# --------------------------------------------------------------------------- #
+# analog
+# --------------------------------------------------------------------------- #
+def solve_analog(problem, dt=None, t_max=600.0, dual_gain=None, tol=1e-10,
+                 record_every=20, x0=None, network=None, active_threshold=1e-9):
+    start = time.perf_counter()
+    network = network or compile_network(problem)
+    n, m = network.size, network.n_constraints
+    spectrum = network.spectrum()
 
-        u' = -u + W a + bias - A'v       a = shrink(u, lam1) / nu_f
-        w' = beta (A a - k)              v = max(w, 0)
-
-    The dual state w is a signed integrator and v is its rectified readout.
-    Rectifying w' instead would make every multiplier monotone, so a constraint
-    that was violated once could never go slack again. w is also clamped from
-    below so a long feasible stretch can't wind it arbitrarily negative.
-    """
-    t0 = time.perf_counter()
-    spec = spec if spec is not None else compile_network(prob)
-    n, m = spec.n, spec.m
-    sp = spec.spectrum()
-
-    if dt is None:
-        dt = min(0.5, 0.9 * sp["max_euler_step"])
+    dt = dt or min(0.5, 0.9 * spectrum["max_euler_step"])
     if dual_gain is None:
-        dual_gain = _default_dual_gain(spec)
+        dual_gain = _dual_gain(network)
 
-    u = np.zeros(n)
-    w = np.zeros(m)
-    v = np.zeros(m)
-    w_floor = -10.0 * (1.0 + np.abs(spec.k)) if m else None
+    membrane = np.zeros(n)
+    if x0 is not None:
+        # membrane = activation * threshold + dead_zone * sign gives activation back after shrink
+        a0 = network.scaling.to_network(np.asarray(x0, dtype=float))
+        membrane = a0 * network.threshold + network.dead_zone * np.sign(a0)
 
-    hist = {"time": [], "objective": [], "kkt_residual": [], "violation": []}
-    steps = int(np.ceil(t_max / dt))
+    dual_state = np.zeros(m)
+    multipliers = np.zeros(m)
+    dual_floor = -10 * (1 + np.abs(network.constraint_rhs)) if m else None
+
+    history = {"time": [], "objective": [], "kkt_residual": [], "violation": []}
+    n_steps = int(np.ceil(t_max / dt))
     converged = False
-    i = 0
+    step_index = 0
 
-    def du(u_, v_):
-        d = -u_ + spec.W @ spec.activation(u_) + spec.bias
+    for step_index in range(1, n_steps + 1):
+        activation = network.activation(membrane)
+        change = dt * (-membrane + network.weights @ activation + network.input_current)
         if m:
-            d = d - spec.A.T @ v_
-        return d
+            change -= dt * network.constraint_matrix.T @ multipliers
+        membrane = membrane + change
 
-    for i in range(1, steps + 1):
-        if integrator == "rk4":
-            k1 = du(u, v)
-            k2 = du(u + 0.5 * dt * k1, v)
-            k3 = du(u + 0.5 * dt * k2, v)
-            k4 = du(u + dt * k3, v)
-            delta = (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-        else:
-            delta = dt * du(u, v)
-        u = u + delta
-
-        a = spec.activation(u)
+        activation = network.activation(membrane)
         if m:
-            w = w + dt * dual_gain * (spec.A @ a - spec.k)
-            np.maximum(w, w_floor, out=w)
-            v = np.maximum(w, 0.0)
+            dual_state = dual_state + dt * dual_gain * (network.constraint_matrix @ activation - network.constraint_rhs)
+            np.maximum(dual_state, dual_floor, out=dual_state)
+            multipliers = np.maximum(dual_state, 0.0)
 
-        if i % record_every == 0:
-            x_o = spec.scaling.to_original(a)
-            hist["time"].append(i * dt)
-            hist["objective"].append(float(prob.objective(x_o)))
-            hist["kkt_residual"].append(prob.kkt_residual(x_o, v if m else None))
-            hist["violation"].append(prob.violation(x_o))
+        if step_index % record_every == 0:
+            x_now = network.scaling.to_user(activation)
+            history["time"].append(step_index * dt)
+            history["objective"].append(float(problem.objective(x_now)))
+            history["kkt_residual"].append(problem.kkt_residual(x_now, multipliers if m else None))
+            history["violation"].append(problem.violation(x_now))
 
-        # Settled when the state stops moving and (if constrained) we're feasible.
-        if np.linalg.norm(delta) <= tol * dt * max(1.0, np.linalg.norm(u)):
-            if not m or np.max(spec.A @ a - spec.k, initial=-1.0) <= 1e-9:
+        if tol is not None and np.linalg.norm(change) <= tol * dt * max(1.0, np.linalg.norm(membrane)):
+            if not m or np.max(network.constraint_matrix @ activation - network.constraint_rhs, initial=-1.0) <= 1e-9:
                 converged = True
                 break
 
-    x = spec.scaling.to_original(spec.activation(u))
-    res = Result(x=x, y=(v.copy() if m else None), converged=converged,
-                 iterations=i, solver=f"analog-LCA({integrator})",
-                 wall_time_s=time.perf_counter() - t0, history=hist,
-                 stats={"dt": dt, "sim_time": i * dt, "dual_gain": dual_gain,
-                        "normalized": spec.normalized, **sp})
-    return _finish(res, prob)
+    flops = step_index * (2 * n * n + 10 * n + 4 * m * n)
+    x_raw = network.scaling.to_user(network.activation(membrane))
+    return _make_result(x_raw, problem, active_threshold,
+                        multipliers=multipliers.copy() if m else None,
+                        converged=converged, iterations=step_index, solver="analog-LCA",
+                        wall_time_s=time.perf_counter() - start, history=history,
+                        stats={"dt": dt, "sim_time": step_index * dt, "dual_gain": dual_gain,
+                               "rescaled": network.rescaled, "flops": flops, **spectrum})
 
 
-# ---------------------------------------------------------------------------
-# 4. spiking network
-# ---------------------------------------------------------------------------
-def solve_spiking(prob: CanonicalProblem, dt=None, t_max: float = 600.0,
-                  spike_resolution="auto", precision: float = 0.01,
-                  dual_gain: Optional[float] = None, rate_tau: float = 1.0,
-                  readout: str = "filtered", tol: float = 1e-6,
-                  record_every: int = 200,
-                  spec: Optional[NetworkSpec] = None) -> Result:
-    """Run the network with integrate-and-fire neurons.
-
-    One IF neuron per variable:
-
-        mu'  = bias - mu - W_syn * spikes - A'v      soma current
-        vm'  = shrink(mu, lam1)                      membrane
-        fire when |vm| >= nu_f, then vm -= sign * nu_f
-
-    W_syn = Q - I with a zero diagonal. A neuron's own spikes never reach its
-    own soma; that self-inhibition is the reset. Leaving the diagonal in would
-    quietly turn a LASSO into an elastic net with lam2 = 1/2.
-
-    spike_resolution (gamma)
-        How many spikes make up one unit of activation. The threshold becomes
-        nu_f/gamma and the weights W_syn/gamma; the means are unchanged but
-        each spike nudges its neighbours less. Readout error is roughly
-        (|W| a)_i / gamma - linear in 1/gamma, not 1/sqrt(gamma), because the
-        subtractive reset carries the leftover charge forward instead of
-        throwing it away (each neuron is a sigma-delta modulator). The error is
-        deterministic and not monotone in gamma, so don't try to tune gamma by
-        local search; provision from the formula with some margin.
-
-        "auto" does a short analog pre-pass and picks the smallest gamma that
-        hits `precision` (relative to the largest coefficient). Halving the
-        target error costs 4x the spikes.
-
-    Constraints get one graded-spike neuron each, silent while the constraint
-    is slack. If dt * gamma * a_i > 1 a neuron emits several quanta in one
-    tick - that's the graded regime, where the payload is an integer count.
-
-    readout
-        "filtered"  low-pass of the thresholded soma current (default)
-        "rate"      net spike count / (T * gamma) - carries an O(1/T) bias
-        "analog"    instantaneous shrink(mu) / nu_f
+# --------------------------------------------------------------------------- #
+# spiking
+# --------------------------------------------------------------------------- #
+def solve_spiking(problem, dt=None, t_max=600.0, spikes_per_unit="auto", precision=0.01,
+                  dual_gain=None, filter_tau=1.0, readout="filtered", tol=1e-6,
+                  record_every=200, x0=None, network=None, active_threshold="auto"):
     """
-    t0 = time.perf_counter()
-    spec = spec if spec is not None else compile_network(prob)
-    info = {}
+    Integrate-and-fire network with subtractive reset.
 
-    if dt is None:
-        dt = min(0.2, 0.5 * spec.spectrum()["max_euler_step"])
+    spikes_per_unit: how many spikes represent one unit of activation. "auto"
+    runs a short analog pass and picks the smallest value meeting `precision`.
 
-    if spike_resolution == "auto":
-        gamma, required = _auto_spike_resolution(prob, spec, precision)
+    readout: "filtered" (low-passed soma current), "rate" (spike count / time),
+    or "analog" (instantaneous).
+
+    active_threshold: "auto" uses 3x the estimated spike-noise floor.
+
+    tol=None runs the full t_max with no early stop (for convergence plots).
+    """
+    start = time.perf_counter()
+    network = network or compile_network(problem)
+
+    dt = dt or min(0.2, 0.5 * network.spectrum()["max_euler_step"])
+    if spikes_per_unit == "auto":
+        spikes_per_unit, required = _choose_spikes_per_unit(problem, network, precision)
     else:
-        gamma = required = float(spike_resolution)
-    info["spike_resolution_required"] = required
-    info["resolution_capped"] = bool(required > gamma * (1 + 1e-9))
-
+        spikes_per_unit = required = float(spikes_per_unit)
     if dual_gain is None:
-        dual_gain = _default_dual_gain(spec)
+        dual_gain = _dual_gain(network)
 
-    return _run_spiking(prob, spec, dt, t_max, gamma, dual_gain,
-                        rate_tau, readout, tol, record_every, t0, info)
-
-
-def _auto_spike_resolution(prob, spec, precision, gamma_max=5.0e5):
-    """Pick gamma from a cheap analog pre-pass.
-
-    Filtering a spike train with unit time constant puts noise of variance
-    sum_j W_ij^2 a_j / (2 gamma) into neuron i. Mapped back through the
-    variable scaling, we want scale_i * sigma_i <= precision * max|x|.
-
-    If that asks for more than gamma_max we cap it and note the shortfall in
-    stats - a badly scaled dictionary is what makes a rate code expensive.
-    """
-    pre = solve_analog(prob, t_max=60.0, tol=1e-9, record_every=10 ** 9)
-    a = np.abs(spec.scaling.to_network(pre.x))
-    target = precision * max(float(np.max(np.abs(pre.x), initial=0.0)), 1e-12)
-    sigma_max = np.maximum(target / spec.scaling.scale, 1e-12)
-    need = (np.abs(spec.W) @ a) / sigma_max
-    required = float(np.max(need, initial=1.0))
-    return float(np.clip(required, 1.0, gamma_max)), required
+    extra = {"spikes_per_unit_required": required,
+             "resolution_capped": required > spikes_per_unit * (1 + 1e-9)}
+    return _run_spiking(problem, network, dt, t_max, spikes_per_unit, dual_gain, filter_tau,
+                        readout, tol, record_every, x0, active_threshold, start, extra)
 
 
-def _run_spiking(prob, spec, dt, t_max, gamma, dual_gain, rate_tau,
-                 readout, tol, record_every, t0, info):
-    n, m = spec.n, spec.m
-    W_syn = -spec.W / gamma          # value delivered per spike, zero diagonal
-    nu_eff = spec.nu_f / gamma       # threshold per spike quantum
+def _choose_spikes_per_unit(problem, network, precision, cap=5e5):
+    # readout noise on neuron i ~ (|weights| @ activation)_i / spikes_per_unit
+    pre = solve_analog(problem, t_max=60.0, tol=1e-9, record_every=10**9)
+    activation = np.abs(network.scaling.to_network(pre.x_raw))
+    target = precision * max(float(np.abs(pre.x_raw).max(initial=0.0)), 1e-12)
+    allowed_noise = np.maximum(target / network.scaling.factor, 1e-12)
+    required = float(np.max(np.abs(network.weights) @ activation / allowed_noise, initial=1.0))
+    if network.n_constraints:
+        # constraint neurons also see spike quantisation through the constraint matrix
+        A = network.constraint_matrix
+        constraint_noise = np.abs(A) @ activation
+        required = max(required, float(np.max(constraint_noise, initial=0.0) / target))
+    return float(np.clip(required, 1.0, cap)), required
 
-    mu = np.zeros(n)                 # soma current
-    vm = np.zeros(n)                 # membrane
-    a_filt = np.zeros(n)             # low-passed readout
-    net_count = np.zeros(n)          # signed spike count
+
+def _run_spiking(problem, network, dt, t_max, spikes_per_unit, dual_gain, filter_tau,
+                 readout, tol, record_every, x0, active_threshold, start, extra):
+    n, m = network.size, network.n_constraints
+    synapse_weights = -network.weights / spikes_per_unit
+    fire_level = network.threshold / spikes_per_unit
+
+    soma_current = np.zeros(n)
+    membrane = np.zeros(n)
+    filtered_output = np.zeros(n)
+    spike_count = np.zeros(n)
     spikes = np.zeros(n)
     ever_spiked = np.zeros(n, dtype=bool)
-    total_spikes = syn_events = dual_events = 0.0
+    total_spikes = synaptic_events = dual_events = 0.0
 
-    w = np.zeros(m)
-    v = np.zeros(m)
-    w_floor = -10.0 * (1.0 + np.abs(spec.k)) if m else None
+    if x0 is not None:
+        a0 = network.scaling.to_network(np.asarray(x0, dtype=float))
+        soma_current = a0 * network.threshold + network.dead_zone * np.sign(a0)
+        filtered_output = a0.copy()
 
-    fanout = np.count_nonzero(W_syn, axis=0)
-    hist = {"time": [], "objective": [], "kkt_residual": [], "violation": [],
-            "spikes": [], "rate_error": []}
-    steps = int(np.ceil(t_max / dt))
+    dual_state = np.zeros(m)
+    multipliers = np.zeros(m)
+    dual_floor = -10 * (1 + np.abs(network.constraint_rhs)) if m else None
+
+    fan_out = np.count_nonzero(synapse_weights, axis=0)
+    history = {key: [] for key in ("time", "objective", "kkt_residual", "violation", "spikes")}
+    n_steps = int(np.ceil(t_max / dt))
     converged = False
-    prev = None
-    i = 0
+    previous_output = None
+    settled_checks = 0
+    tick = 0
 
-    for i in range(1, steps + 1):
-        # soma: leak toward bias, minus dual feedback, minus incoming spikes
-        drive_in = spec.bias if not m else spec.bias - spec.A.T @ v
-        mu = mu + dt * (drive_in - mu) - W_syn @ spikes
+    for tick in range(1, n_steps + 1):
+        drive = network.input_current - network.constraint_matrix.T @ multipliers if m else network.input_current
+        soma_current = soma_current + dt * (drive - soma_current) - synapse_weights @ spikes
 
-        # membrane integrates the shrunk current; fire and subtract
-        drive = spec.drive(mu)
-        vm = vm + dt * drive
-        spikes = np.fix(vm / nu_eff)
-        if spec.nonneg:
+        shrunk = network.shrink(soma_current)
+        membrane = membrane + dt * shrunk
+        spikes = np.fix(membrane / fire_level)
+        if network.rectified:
             np.maximum(spikes, 0.0, out=spikes)
         if spikes.any():
-            vm = vm - spikes * nu_eff
-            mag = np.abs(spikes)
-            total_spikes += float(mag.sum())
-            syn_events += float(mag @ fanout)
-            net_count += spikes
-            ever_spiked |= mag > 0
+            membrane -= spikes * fire_level
+            magnitude = np.abs(spikes)
+            total_spikes += magnitude.sum()
+            synaptic_events += magnitude @ fan_out
+            spike_count += spikes
+            ever_spiked |= magnitude > 0
 
-        # filtered readout
-        a_filt += (dt / rate_tau) * (drive / spec.nu_f - a_filt)
+        filtered_output += dt / filter_tau * (shrunk / network.threshold - filtered_output)
 
-        # dual layer. Feed it the raw spikes, not the filtered readout: the
-        # integrator w already does the averaging, and putting a low-pass in
-        # the feedback loop just adds lag and can destabilise it.
         if m:
-            w = w + dual_gain * ((spec.A @ spikes) / gamma - spec.k * dt)
-            np.maximum(w, w_floor, out=w)
-            v = np.maximum(w, 0.0)
-            dual_events += float(np.count_nonzero(v))
+            dual_state = dual_state + dual_gain * (network.constraint_matrix @ spikes / spikes_per_unit
+                                                   - network.constraint_rhs * dt)
+            np.maximum(dual_state, dual_floor, out=dual_state)
+            multipliers = np.maximum(dual_state, 0.0)
+            dual_events += np.count_nonzero(multipliers)
 
-        if i % record_every == 0:
-            t_now = i * dt
-            x_o = spec.scaling.to_original(a_filt)
-            hist["time"].append(t_now)
-            hist["objective"].append(float(prob.objective(x_o)))
-            hist["kkt_residual"].append(prob.kkt_residual(x_o, v if m else None))
-            hist["violation"].append(prob.violation(x_o))
-            hist["spikes"].append(total_spikes)
-            hist["rate_error"].append(
-                float(np.linalg.norm(net_count / (t_now * gamma) - a_filt)))
+        if tick % record_every == 0:
+            x_now = network.scaling.to_user(filtered_output)
+            history["time"].append(tick * dt)
+            history["objective"].append(float(problem.objective(x_now)))
+            history["kkt_residual"].append(problem.kkt_residual(x_now, multipliers if m else None))
+            history["violation"].append(problem.violation(x_now))
+            history["spikes"].append(total_spikes)
 
-            if prev is not None and np.linalg.norm(a_filt - prev) <= tol * max(
-                    1.0, np.linalg.norm(a_filt)):
-                if not m or np.max(spec.A @ a_filt - spec.k, initial=-1.0) <= 1e-8:
+            if tol is not None and previous_output is not None:
+                # can't settle tighter than the spike noise floor, so stop there
+                noise_now = float(np.max(np.abs(network.weights) @ np.abs(filtered_output), initial=0.0)) / spikes_per_unit
+                settle_tol = max(tol, noise_now)
+                settled = np.linalg.norm(filtered_output - previous_output) <= settle_tol * max(1.0, np.linalg.norm(filtered_output))
+                feasible = not m or np.max(network.constraint_matrix @ filtered_output - network.constraint_rhs, initial=-1.0) <= 1e-8
+                settled_checks = settled_checks + 1 if (settled and feasible) else 0
+                if settled_checks >= 2:
                     converged = True
                     break
-            prev = a_filt.copy()
+            previous_output = filtered_output.copy()
 
-    T = i * dt
-    a_rate = net_count / (T * gamma)
-    a = {"filtered": a_filt, "rate": a_rate, "analog": spec.activation(mu)}[readout]
-    x = spec.scaling.to_original(a)
+    sim_time = tick * dt
+    rate_output = spike_count / (sim_time * spikes_per_unit)
+    activation = {"filtered": filtered_output, "rate": rate_output, "analog": network.activation(soma_current)}[readout]
 
-    # Noise floor on the readout, used to decide what counts as "non-zero".
-    sigma = float(np.max(np.abs(spec.W) @ np.abs(a_filt), initial=0.0)
-                  / gamma) / float(np.min(spec.nu_f))
-    support_tol = max(1e-9, 3.0 * sigma)
+    noise_floor = float(np.max(np.abs(network.weights) @ np.abs(filtered_output), initial=0.0)) / spikes_per_unit / float(network.threshold.min())
+    if active_threshold == "auto":
+        active_threshold = max(1e-9, 3 * noise_floor)
 
-    res = Result(
-        x=x, y=(v.copy() if m else None), converged=converged, iterations=i,
-        solver=f"spiking-LCA[{readout}]", wall_time_s=time.perf_counter() - t0,
-        history=hist, support_tol=support_tol,
+    # software cost of the simulation: dense matvec per tick
+    flops = tick * (2 * n * n + 12 * n + 4 * m * n)
+
+    return _make_result(
+        network.scaling.to_user(activation), problem, active_threshold,
+        multipliers=multipliers.copy() if m else None,
+        converged=converged, iterations=tick,
+        solver=f"spiking-LCA[{readout}]",
+        wall_time_s=time.perf_counter() - start, history=history,
         stats={
-            "dt": dt, "sim_time": T, "spike_resolution": gamma,
+            "dt": dt,
+            "sim_time": sim_time,
+            "spikes_per_unit": spikes_per_unit,
             "dual_gain": dual_gain,
-            "total_spikes": total_spikes,
-            "spikes_per_neuron": total_spikes / max(n, 1),
-            "dual_graded_events": dual_events,
+            "total_spikes": float(total_spikes),
+            "spikes_per_neuron": float(total_spikes) / max(n, 1),
+            "synaptic_events": float(synaptic_events),
+            "neuron_updates": float(tick * (n + m)),
+            "dual_events": float(dual_events),
             "never_spiked_fraction": float(np.mean(~ever_spiked)),
-            "active_fraction": float(np.mean(np.abs(a) > support_tol)),
-            "readout_noise_sigma": sigma,
-            "readout_rate_vs_analog": float(np.linalg.norm(a_rate - a_filt)),
-            "synaptic_events": syn_events,
-            "neuron_steps": float(i * (n + m)),
-            **spec.spectrum(), **info,
+            "noise_floor": noise_floor,
+            "rate_vs_filtered": float(np.linalg.norm(rate_output - filtered_output)),
+            "flops": flops,
+            **network.spectrum(),
+            **extra,
         },
     )
-    return _finish(res, prob)
